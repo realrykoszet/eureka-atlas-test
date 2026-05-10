@@ -1,0 +1,133 @@
+name: Atlas Token Report
+
+# AGENT 3 assignment 2026-05-10 - Eureca Atlas as developer-facing CI integration
+# Posts sticky PR comment with token cost report from Atlas /v1/stats endpoint
+# Per Architektura/research/09_integrations_ecosystem_extensions.md (highest ICP fit)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write
+  contents: read
+  issues: write
+
+jobs:
+  atlas-token-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch Atlas /v1/stats (graceful failure)
+        id: atlas
+        env:
+          ATLAS_URL: ${{ secrets.ATLAS_URL }}
+          ATLAS_API_KEY: ${{ secrets.ATLAS_API_KEY }}
+        run: |
+          set +e
+          # Atlas URL fallback for demo - replace with self-hosted or hosted instance
+          ATLAS_URL_RESOLVED="${ATLAS_URL:-https://atlas.example.com}"
+          echo "Querying Atlas at: $ATLAS_URL_RESOLVED/v1/stats?window_minutes=60"
+
+          # 5-second connect timeout, 10-second total timeout, retry 2 times
+          # -k allowed for self-signed dev cert; production should use real cert
+          HTTP_CODE=$(curl -ks --connect-timeout 5 --max-time 10 --retry 2 \
+            -o stats.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${ATLAS_API_KEY:-demo}" \
+            "$ATLAS_URL_RESOLVED/v1/stats?window_minutes=60" || echo "000")
+
+          echo "HTTP code: $HTTP_CODE"
+          if [ "$HTTP_CODE" = "200" ] && [ -s stats.json ]; then
+            echo "atlas_reachable=true" >> "$GITHUB_OUTPUT"
+            echo "Atlas reachable, stats fetched"
+          else
+            echo "atlas_reachable=false" >> "$GITHUB_OUTPUT"
+            echo "Atlas unreachable or non-200; will post fallback comment"
+            echo "{}" > stats.json
+          fi
+
+      - name: Format markdown summary
+        id: format
+        run: |
+          set -e
+          REACHABLE="${{ steps.atlas.outputs.atlas_reachable }}"
+          NOW_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          if [ "$REACHABLE" = "true" ]; then
+            PROCESSED=$(jq -r '.total_tokens_processed // 0' stats.json)
+            SAVED=$(jq -r '.total_tokens_saved // 0' stats.json)
+            REDUCTION=$(jq -r '.reduction_pct // 0' stats.json)
+            ENTRIES=$(jq -r '.total_entries // 0' stats.json)
+            WINDOW=$(jq -r '.window_hours // 1' stats.json)
+
+            # Top 3 tools by savings (excludes "unknown" bucket)
+            TOP3=$(jq -r '
+              .per_tool
+              | to_entries
+              | map(select(.key != "unknown"))
+              | sort_by(-(.value.saved // 0))
+              | .[0:3]
+              | map("- **\(.key)** -- \(.value.saved // 0) tokens saved (\(.value.count // 0) calls)")
+              | join("\n")
+            ' stats.json)
+
+            # Numeric thousands separator (LC_ALL=en_US.UTF-8 for printf)
+            PROCESSED_FMT=$(LC_ALL=en_US.UTF-8 printf "%'d" "$PROCESSED" 2>/dev/null || echo "$PROCESSED")
+            SAVED_FMT=$(LC_ALL=en_US.UTF-8 printf "%'d" "$SAVED" 2>/dev/null || echo "$SAVED")
+
+            cat > comment_body.md <<EOF
+          ## :coin: Atlas Token Report
+          <!-- atlas-token-report-marker -->
+
+          **Window**: last ${WINDOW}h (rolling)
+          **Tokens processed**: ${PROCESSED_FMT}
+          **Tokens saved**: ${SAVED_FMT} (**${REDUCTION}%** reduction)
+          **Total tool calls**: ${ENTRIES}
+
+          ### Top 3 tools by savings
+          ${TOP3}
+
+          ---
+          *Powered by Eureca Atlas - updated ${NOW_UTC}*
+          EOF
+          else
+            cat > comment_body.md <<EOF
+          ## :coin: Atlas Token Report
+          <!-- atlas-token-report-marker -->
+
+          **Status**: Atlas server unreachable. Token report unavailable for this commit.
+
+          - Check ATLAS_URL secret is set correctly
+          - Verify Atlas server health endpoint responds: \`curl \$ATLAS_URL/v1/health\`
+          - Self-hosted users: ensure server is running
+
+          *Workflow did not fail - this comment is informational only.*
+
+          ---
+          *Powered by Eureca Atlas - updated ${NOW_UTC}*
+          EOF
+          fi
+
+          echo "--- Comment preview ---"
+          cat comment_body.md
+
+      - name: Find existing sticky comment
+        id: find_comment
+        if: github.event.pull_request.number != ''
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- atlas-token-report-marker -->'
+
+      - name: Post or update sticky PR comment
+        if: github.event.pull_request.number != ''
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find_comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: comment_body.md
+          edit-mode: replace
